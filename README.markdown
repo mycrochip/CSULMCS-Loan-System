@@ -34,6 +34,8 @@ This system uses:
 - **Archive Sheet**: Stores completed or expired applications.
 - **Robustness**: Prevents duplicate submissions, validates emails, locks completed applications, and supports multiple pending groups.
 - **Custom Menu**: Admins can reset, archive, or notify groups via a "CSULMCS Loan System" menu in the Sheet.
+- **Polite Notifications**: Emails use courteous language (e.g., Please, Thank you, Kindly) for a professional tone.
+- **Finance Officer Timeframe**: Finance Officers are notified to review applications within 7 days, matching the guarantor response period.
 
 ## Prerequisites
 - **Google Account** with access to Google Sheets, Forms, and Apps Script.
