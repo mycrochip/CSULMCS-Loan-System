@@ -1,1029 +1,883 @@
 /**
  * CSULMCS Loan Management System Script
- * This is like a magical toy box that automates loan applications with Google Sheets and Forms!
- * Handles sign-ups (Intent Form), loan applications (Application Form), Finance Officer assignments, and notifications.
- * Sends polite emails and tracks everything in a Google Sheet.
+ * A magical toy box automating loan applications with Google Sheets and Forms!
+ * Handles Intent Form sign-ups, Application Form processing, Finance Officer assignments, and notifications.
  * Features:
- * - Applicants sign up with two guarantors in one Intent Form submission.
- * - One email to applicant with GroupID after Intent Form submission.
- * - Admins assign Finance Officers per loan group in the Control tab.
- * - Applications pend until a Finance Officer is assigned (e.g., waiting for funds).
- * - 7-day guarantor reminder countdown starts only after Finance Officer assignment.
- * - Manual trigger to notify newly assigned groups via custom menu.
- * - Notifications sent only to groups starting application flow after officer assignment.
- * - Intent tab: One row per participant (applicant + guarantors), unique by GroupID + CooperatorID.
- * - Control tab: Tracks loan details, including Finance Officer per GroupID.
- * - Tabs: Intent, Control, Archive.
- * - New applications can be submitted with new GroupIDs without unlocking existing ones.
+ * - Applicants sign up with two guarantors via Intent Form.
+ * - One email to applicant with GroupID post-Intent submission.
+ * - Admins assign Finance Officers per group in Control tab, or auto-assign from FinanceOfficers sheet.
+ * - Applications pend until Finance Officer is assigned.
+ * - 7-day guarantor reminder countdown starts post-assignment.
+ * - Manual notification trigger for newly assigned groups.
+ * - Intent tab: One row per participant (applicant + guarantors).
+ * - Control tab: Tracks loan details with statuses.
+ * - Archive, FinanceOfficers, Logs tabs for completed apps, officer data, and actions.
  */
 
-// --- SETTINGS (Like picking colors for our toy) ---
-const CONTROL_SHEET_NAME = 'Control'; // Name of the Control tab
-const ARCHIVE_SHEET_NAME = 'Archive'; // Name of the Archive tab
-const LOAN_APPLICATION_FORM_ID = '[LOAN_APPLICATION_FORM_ID]'; // Replace with Application Form ID
-const LOAN_INTENT_FORM_ID = '[LOAN_INTENT_FORM_ID]'; // Replace with Intent Form ID
-const LOAN_INTENT_SHEET_NAME = 'Intent'; // Name of the Intent tab
-const REMINDER_DAYS_LIMIT = 7; // Guarantors have 7 days to respond
-const ROLE_APPLICANT = 'Applicant'; // Role for the person asking for a loan
-const ROLE_FINANCE = 'Finance Officer'; // Role for the checker
-const ROLE_GUARANTOR1 = 'Guarantor1'; // Role for first friend
-const ROLE_GUARANTOR2 = 'Guarantor2'; // Role for second friend
-const SENDER_NAME = 'CSULMCS Finance Team'; // Name on emails
+// --- SETTINGS ---
+const CONTROL_SHEET_NAME = 'Control';
+const ARCHIVE_SHEET_NAME = 'Archive';
+const LOAN_INTENT_SHEET_NAME = 'Intent';
+const FINANCE_OFFICERS_SHEET_NAME = 'FinanceOfficers';
+const LOGS_SHEET_NAME = 'Logs';
+const REMINDER_DAYS_LIMIT = 7;
+const ROLE_APPLICANT = 'Applicant';
+const ROLE_FINANCE = 'Finance Officer';
+const ROLE_GUARANTOR = 'Guarantor';
+const SENDER_NAME = 'CSULMCS Finance Team';
 const EMAIL_FOOTER = `
   <hr style="border: 1px solid #ccc; margin: 20px 0;">
-  <p style="font-size: 12px; color: #666; text-align: center;">
-    This email was sent by the <strong>CSULMCS Loan Management System</strong>.<br>
+  <p style="font-size: 12px; color: #333; text-align: center;">
+    Sent by the <strong>CSULMCS Loan Management System</strong>.<br>
     © 2025 CSULMCS. All rights reserved.
-  </p>`; // Bottom of every email
-const EMAIL_REGARDS = `<p>Regards,<br>CSULMCS Finance Team</p>`; // Email signature
+  </p>`;
+const EMAIL_REGARDS = `<p style="font-family: Arial, sans-serif;">Regards,<br>CSULMCS Finance Team</p>`;
 
-// --- HELPER FUNCTIONS (Like little tools in our toy box) ---
+// --- HELPERS ---
 
 /**
- * Gets the Control tab, like opening the loan tracking page.
- * @returns {GoogleAppsScript.Spreadsheet.Sheet} The Control sheet.
+ * Gets column index by header in a sheet.
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet The sheet to search.
+ * @param {string} header Column header.
+ * @returns {number} 1-based column index.
  */
-function getControlSheet() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet(); // Open our notebook
-  const sheet = ss.getSheetByName(CONTROL_SHEET_NAME); // Find Control page
-  if (!sheet) throw new Error('Control sheet not found'); // Oops, page missing!
-  return sheet;
+function getColumnIndex(sheet, header) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const index = headers.indexOf(header);
+  if (index === -1) throw new Error(`Header '${header}' not found in ${sheet.getName()}`);
+  return index + 1;
 }
 
 /**
- * Gets or creates the Archive tab, like a box for old toys.
- * @returns {GoogleAppsScript.Spreadsheet.Sheet} The Archive sheet.
+ * Gets Control sheet, creating it if needed.
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet} Control sheet.
  */
-function getArchiveSheet() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet(); // Open notebook
-  let sheet = ss.getSheetByName(ARCHIVE_SHEET_NAME); // Look for Archive page
-  if (!sheet) { // If not found, make a new one
-    sheet = ss.insertSheet(ARCHIVE_SHEET_NAME);
-    // Add labels, like writing a list
-    sheet.getRange(1, 1, 1, 40).setValues([[
+function getControlSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(CONTROL_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(CONTROL_SHEET_NAME);
+    sheet.getRange(1, 1, 1, 41).setValues([[
       'GroupID', 'CooperatorID', 'Name', 'Email', 'Phone', 'HomeAddress', 'LoanAmountFigures',
       'LoanAmountWords', 'RepaymentPeriod', 'Guarantor1Name', 'Guarantor1ID', 'Guarantor1Email', 'Guarantor1Phone',
-      'Guarantor2Name', 'Guarantor2ID', 'Guarantor2Email', 'Guarantor2Phone', 'ApproverName',
-      'ApproverID', 'ApproverEmail', 'ApproverPhone', 'Status', 'ApplicantLink', 'FinanceLink', 'ApplicationStatus',
-      'Locked', 'Timestamp', 'Comments', 'BankName', 'AccountName', 'AccountNumber', 'ApplicantBalance',
-      'ApplicantRating', 'Guarantor1Balance', 'Guarantor1Rating', 'Guarantor2Balance', 'Guarantor2Rating',
-      'FinanceOfficerName', 'FinanceOfficerID', 'FinanceOfficerEmail', 'FinanceOfficerPhone'
+      'Guarantor2Name', 'Guarantor2ID', 'Guarantor2Email', 'Guarantor2Phone', 'ApproverName', 'ApproverID',
+      'ApproverEmail', 'ApproverPhone', 'Status', 'ApplicantLink', 'FinanceLink', 'ApplicationStatus', 'Locked',
+      'Timestamp', 'Comments', 'BankName', 'AccountName', 'AccountNumber', 'ApplicantBalance', 'ApplicantRating',
+      'Guarantor1Balance', 'Guarantor1Rating', 'Guarantor2Balance', 'Guarantor2Rating', 'FinanceOfficerName',
+      'FinanceOfficerID', 'FinanceOfficerEmail', 'FinanceOfficerPhone', 'Notified'
     ]]);
   }
   return sheet;
 }
 
 /**
- * Makes a new GroupID, like giving a new toy a number (LC0001, LC0002, etc.).
- * @returns {string} A new GroupID.
+ * Gets or creates Archive sheet.
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet} Archive sheet.
  */
-function generateGroupID() {
-  const sheet = getControlSheet(); // Open Control page
-  const lastRow = sheet.getLastRow(); // Find the last toy
-  if (lastRow < 2) return 'LC0001'; // If no toys, start with LC0001
-  const lastID = sheet.getRange(lastRow, 1).getValue(); // Get last toy’s number
-  const num = parseInt(lastID.replace(/[^\d]/g, ''), 10); // Get the number part
-  return 'LC' + (num + 1).toString().padStart(4, '0'); // Add 1, make it LC0002
+function getArchiveSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(ARCHIVE_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(ARCHIVE_SHEET_NAME);
+    sheet.getRange(1, 1, 1, 41).setValues([getControlSheet().getRange(1, 1, 1, 41).getValues()[0]]);
+  }
+  return sheet;
 }
 
 /**
- * Gets special codes for form fields, like finding toy labels.
- * @param {string} formId The form’s ID.
- * @returns {Object} Codes for Loan ID, Role, and Email fields.
+ * Gets or creates FinanceOfficers sheet.
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet} FinanceOfficers sheet.
  */
-function getFormEntryIDs(formId) {
+function getFinanceOfficersSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(FINANCE_OFFICERS_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(FINANCE_OFFICERS_SHEET_NAME);
+    sheet.getRange(1, 1, 1, 4).setValues([['Name', 'ID', 'Email', 'Phone']]);
+  }
+  return sheet;
+}
+
+/**
+ * Gets or creates Logs sheet.
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet} Logs sheet.
+ */
+function getLogsSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(LOGS_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(LOGS_SHEET_NAME);
+    sheet.getRange(1, 1, 1, 3).setValues([['Timestamp', 'Action', 'Details']]);
+  }
+  return sheet;
+}
+
+/**
+ * Logs an action to Logs sheet.
+ * @param {string} action Action performed.
+ * @param {string} details Details of the action.
+ */
+function logAction(action, details) {
+  const sheet = getLogsSheet();
+  sheet.appendRow([new Date(), action, details]);
+}
+
+/**
+ * Generates a unique GroupID (e.g., LC0001).
+ * @returns {string} GroupID.
+ */
+function generateGroupID() {
+  const sheet = getControlSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 'LC0001';
+  const lastID = sheet.getRange(lastRow, 1).getValue();
+  const num = parseInt(lastID.replace('LC', ''), 10);
+  return 'LC' + (num + 1).toString().padStart(4, '0');
+}
+
+/**
+ * Gets form entry IDs for prefilling.
+ * @param {string} formId Form ID.
+ * @returns {Object} Entry IDs for form fields.
+ */
+function getFormEntryIds(formId) {
   try {
-    const form = FormApp.openById(formId); // Open the form
-    const items = form.getItems(); // Get all questions
-    const entryIDs = {};
+    const form = FormApp.openById(formId);
+    const items = form.getItems();
+    const entryIds = {};
     items.forEach(item => {
-      const title = item.getTitle(); // Question name
-      const id = item.asTextItem()?.getId() || item.asMultipleChoiceItem()?.getId();
-      if (id) entryIDs[title] = `entry.${id}`; // Save code like entry.123456
+      const title = item.getTitle();
+      const id = item.asTextItem()?.getId() || item.asListItem()?.getId() || item.asMultipleChoiceItem()?.getId();
+      if (id) entryIds[title] = `entry.${id}`;
     });
     return {
-      'Loan ID': entryIDs['Loan ID'] || '',
-      'Role': entryIDs['Role'] || '',
-      'Email': entryIDs['Email'] || ''
+      'Loan ID': entryIds['Loan ID'] || '',
+      'Role': entryIds['Role'] || '',
+      'Email': entryIds['Email'] || ''
     };
   } catch (e) {
-    Logger.log(`Error getting form codes: ${e.message}`); // Oops, something broke
+    logAction('Error', `Failed to get form entry IDs: ${e.message}`);
     return {};
   }
 }
 
 /**
- * Makes a special link to fill the form, like a magic key.
- * @param {string} groupID The loan code (e.g., LC0001).
- * @param {string} role Who’s filling it (Applicant, Guarantor1, etc.).
- * @param {string} email Their email.
- * @returns {string} A web link.
+ * Generates a prefilled form link.
+ * @param {string} groupID Group ID.
+ * @param {string} role Role (Applicant, Guarantor, Finance Officer).
+ * @param {string} email Email address.
+ * @returns {string} Prefilled form URL.
  */
 function generatePrefilledLink(groupID, role, email) {
-  const formUrl = FormApp.openById(LOAN_APPLICATION_FORM_ID).getPublishedUrl().replace('/viewform', '/viewform?');
-  const entryIDs = getFormEntryIDs(LOAN_APPLICATION_FORM_ID); // Get form codes
-  if (!entryIDs['Loan ID'] || !entryIDs['Role'] || !entryIDs['Email']) {
-    Logger.log('Missing form codes'); // Oops, no codes
+  const formId = PropertiesService.getScriptProperties().getProperty('LOAN_APPLICATION_FORM_ID');
+  if (!formId) {
+    logAction('Error', 'Application Form ID not set');
     return '';
   }
-  // Make the link with the right info
-  return `${formUrl}${entryIDs['Loan ID']}=${encodeURIComponent(groupID)}&${entryIDs['Role']}=${encodeURIComponent(role)}&${entryIDs['Email']}=${encodeURIComponent(email)}`;
+  try {
+    const formUrl = FormApp.openById(formId).getPublishedUrl().replace('/viewform', '/viewform?');
+    const entryIds = getFormEntryIds(formId);
+    if (!entryIds['Loan ID'] || !entryIds['Role'] || !entryIds['Email']) {
+      logAction('Error', 'Missing form entry IDs');
+      return '';
+    }
+    return `${formUrl}${entryIds['Loan ID']}=${encodeURIComponent(groupID)}&${entryIds['Role']}=${encodeURIComponent(role)}&${entryIds['Email']}=${encodeURIComponent(email)}`;
+  } catch (e) {
+    logAction('Error', `Failed to generate prefilled link: ${e.message}`);
+    return '';
+  }
 }
 
 /**
- * Turns info into a pretty table, like drawing a neat chart.
- * @param {Object} dataObj The info to show.
- * @returns {string} HTML code for a table.
+ * Builds an HTML table from an object.
+ * @param {Object} dataObj Key-value pairs for table.
+ * @returns {string} HTML table string.
  */
 function buildHtmlTableFromObject(dataObj) {
   let rows = '';
   for (const key in dataObj) {
     if (dataObj.hasOwnProperty(key)) {
-      rows += `<tr><td style="border:1px solid #ddd;padding:8px;"><strong>${key}</strong></td><td style="border:1px solid #ddd;padding:8px;">${dataObj[key] || ''}</td></tr>`;
+      rows += `<tr><td style="border:1px solid #ddd;padding:8px;font-family:Arial,sans-serif;"><strong>${key}</strong></td><td style="border:1px solid #ddd;padding:8px;font-family:Arial,sans-serif;">${dataObj[key] || ''}</td></tr>`;
     }
   }
-  return `<table style="border-collapse:collapse;border:2px solid #ddd;">${rows}</table>`;
+  return `<table style="border-collapse:collapse;border:2px solid #ddd;font-family:Arial,sans-serif;">${rows}</table>`;
 }
 
 /**
- * Sends an email, like mailing a letter.
- * @param {string} to Who gets the letter.
- * @param {string} subject The letter’s title.
- * @param {string} bodyHtml The letter’s message.
+ * Sends an email with HTML content.
+ * @param {string} to Recipient email.
+ * @param {string} subject Email subject.
+ * @param {string} bodyHtml HTML email body.
  */
 function sendEmail(to, subject, bodyHtml) {
   if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
-    Logger.log(`Bad email address: ${to}`); // Oops, wrong address
+    logAction('Error', `Invalid email address: ${to}`);
     return;
   }
   try {
     MailApp.sendEmail({
       to: to,
       subject: subject,
-      htmlBody: bodyHtml + EMAIL_REGARDS + EMAIL_FOOTER, // Add signature and footer
-      name: SENDER_NAME // From the toy team
+      htmlBody: bodyHtml + EMAIL_REGARDS + EMAIL_FOOTER,
+      name: SENDER_NAME
     });
+    logAction('Email Sent', `To: ${to}, Subject: ${subject}`);
   } catch (e) {
-    Logger.log(`Error sending email to ${to}: ${e.message}`);
+    logAction('Error', `Failed to send email to ${to}: ${e.message}`);
   }
 }
 
 /**
- * Checks if a Finance Officer is assigned for a GroupID in the Control tab.
- * @param {string} groupID The loan code.
- * @returns {boolean} True if assigned, false if not.
+ * Checks if a Finance Officer is assigned for a group.
+ * @param {string} groupID Group ID.
+ * @returns {boolean} True if assigned.
  */
 function checkFinanceOfficerExists(groupID) {
-  const sheet = getControlSheet(); // Open Control tab
-  const data = sheet.getDataRange().getValues(); // Read all loans
-  return data.some(row => row[0] === groupID && row[37] && row[38] && row[39] && row[40]); // Check Finance Officer fields
+  const sheet = getControlSheet();
+  const data = sheet.getDataRange().getValues();
+  const cols = {
+    groupID: getColumnIndex(sheet, 'GroupID'),
+    foName: getColumnIndex(sheet, 'FinanceOfficerName'),
+    foId: getColumnIndex(sheet, 'FinanceOfficerID'),
+    foEmail: getColumnIndex(sheet, 'FinanceOfficerEmail'),
+    foPhone: getColumnIndex(sheet, 'FinanceOfficerPhone')
+  };
+  return data.some(row => row[cols.groupID - 1] === groupID && row[cols.foName - 1] && row[cols.foId - 1] && row[cols.foEmail - 1] && row[cols.foPhone - 1]);
 }
 
 /**
- * Gets the Finance Officer’s info for a GroupID from the Control tab.
- * @param {string} groupID The loan code.
- * @returns {Object|null} Their details or null if not found.
+ * Gets Finance Officer details for a group.
+ * @param {string} groupID Group ID.
+ * @returns {Object|null} Officer details or null.
  */
 function getFinanceOfficer(groupID) {
-  const sheet = getControlSheet(); // Open Control tab
-  const data = sheet.getDataRange().getValues(); // Read loans
-  const row = data.find(row => row[0] === groupID); // Find GroupID
-  if (!row || !row[37] || !row[38] || !row[39] || !row[40]) return null; // No Finance Officer
+  const sheet = getControlSheet();
+  const data = sheet.getDataRange().getValues();
+  const cols = {
+    groupID: getColumnIndex(sheet, 'GroupID'),
+    foName: getColumnIndex(sheet, 'FinanceOfficerName'),
+    foId: getColumnIndex(sheet, 'FinanceOfficerID'),
+    foEmail: getColumnIndex(sheet, 'FinanceOfficerEmail'),
+    foPhone: getColumnIndex(sheet, 'FinanceOfficerPhone')
+  };
+  const row = data.find(row => row[cols.groupID - 1] === groupID);
+  if (!row || !row[cols.foName - 1]) return null;
   return {
-    name: row[37], // FinanceOfficerName
-    id: row[38], // FinanceOfficerID
-    email: row[39], // FinanceOfficerEmail
-    phone: row[40] // FinanceOfficerPhone
+    name: row[cols.foName - 1],
+    id: row[cols.foId - 1],
+    email: row[cols.foEmail - 1],
+    phone: row[cols.foPhone - 1]
   };
 }
 
 /**
- * Updates dropdowns in the Application Form, like filling a toy’s choices.
+ * Auto-assigns a Finance Officer to a group.
+ * @param {string} groupID Group ID.
+ */
+function autoAssignFinanceOfficer(groupID) {
+  const foSheet = getFinanceOfficersSheet();
+  const foData = foSheet.getDataRange().getValues().slice(1).filter(row => row[0] && row[1] && row[2] && row[3]);
+  if (foData.length === 0) {
+    logAction('Error', `No Finance Officers available for GroupID: ${groupID}`);
+    return;
+  }
+  const randomIndex = Math.floor(Math.random() * foData.length);
+  const fo = foData[randomIndex];
+  const sheet = getControlSheet();
+  const data = sheet.getDataRange().getValues();
+  const cols = {
+    groupID: getColumnIndex(sheet, 'GroupID'),
+    foName: getColumnIndex(sheet, 'FinanceOfficerName'),
+    foId: getColumnIndex(sheet, 'FinanceOfficerID'),
+    foEmail: getColumnIndex(sheet, 'FinanceOfficerEmail'),
+    foPhone: getColumnIndex(sheet, 'FinanceOfficerPhone')
+  };
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][cols.groupID - 1] === groupID) {
+      sheet.getRange(i + 1, cols.foName, 1, 4).setValues([[fo[0], fo[1], fo[2], fo[3]]]);
+      logAction('Auto-Assign', `GroupID: ${groupID}, Officer: ${fo[0]}`);
+      break;
+    }
+  }
+}
+
+/**
+ * Sets up Form IDs by prompting for form titles.
+ */
+function setUpFormIds() {
+  const ui = SpreadsheetApp.getUi();
+  const intentFormTitle = ui.prompt('Enter Intent Form Title').getResponseText();
+  const appFormTitle = ui.prompt('Enter Application Form Title').getResponseText();
+  try {
+    const forms = DriveApp.getFilesByType(MimeType.GOOGLE_FORMS);
+    let intentFormId, appFormId;
+    while (forms.hasNext()) {
+      const form = forms.next();
+      const formApp = FormApp.openById(form.getId());
+      if (formApp.getTitle() === intentFormTitle) intentFormId = form.getId();
+      if (formApp.getTitle() === appFormTitle) appFormId = form.getId();
+    }
+    if (!intentFormId || !appFormId) {
+      ui.alert('Error: One or both forms not found. Set IDs manually in Script Properties.');
+      logAction('Error', `Forms not found: Intent=${intentFormTitle}, Application=${appFormTitle}`);
+      return;
+    }
+    PropertiesService.getScriptProperties().setProperties({
+      'LOAN_INTENT_FORM_ID': intentFormId,
+      'LOAN_APPLICATION_FORM_ID': appFormId
+    });
+    ui.alert('Success: Form IDs set.');
+    logAction('Setup', `Form IDs set: Intent=${intentFormId}, Application=${appFormId}`);
+  } catch (e) {
+    ui.alert('Error: Failed to set Form IDs. Check logs.');
+    logAction('Error', `Setting Form IDs: ${e.message}`);
+  }
+}
+
+/**
+ * Updates Application Form dropdowns with participant data.
  */
 function syncParticipantDetails() {
   const intentSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LOAN_INTENT_SHEET_NAME);
   const controlSheet = getControlSheet();
-  const intentData = intentSheet.getDataRange().getValues().slice(1); // Skip header
-  const controlData = controlSheet.getDataRange().getValues().slice(1); // Skip header
+  if (!intentSheet) {
+    logAction('Error', 'Intent sheet not found');
+    return;
+  }
+  const intentData = intentSheet.getDataRange().getValues().slice(1);
+  const controlData = controlSheet.getDataRange().getValues().slice(1);
+  const formId = PropertiesService.getScriptProperties().getProperty('LOAN_APPLICATION_FORM_ID');
+  if (!formId) {
+    logAction('Error', 'Application Form ID not set');
+    return;
+  }
   try {
-    const form = FormApp.openById(LOAN_APPLICATION_FORM_ID); // Open Application Form
-    const items = form.getItems(); // Get questions
-
-    // Choices for each question
+    const form = FormApp.openById(formId);
+    const items = form.getItems();
     const fieldMap = {
-      'Cooperator ID': intentData.filter(row => row[6] === 'Applicant').map(row => row[2]),
-      'Name': intentData.filter(row => row[6] === 'Applicant').map(row => row[3]),
-      'Phone': intentData.filter(row => row[6] === 'Applicant').map(row => row[4]),
-      'Email': intentData.filter(row => row[6] === 'Applicant').map(row => row[5]),
-      'Guarantor 1 Name': intentData.filter(row => row[6] === 'Guarantor').map(row => row[3]),
-      'Guarantor 1 Cooperator ID': intentData.filter(row => row[6] === 'Guarantor').map(row => row[2]),
-      'Guarantor 1 Email': intentData.filter(row => row[6] === 'Guarantor').map(row => row[5]),
-      'Guarantor 1 Phone': intentData.filter(row => row[6] === 'Guarantor').map(row => row[4]),
-      'Guarantor 2 Name': intentData.filter(row => row[6] === 'Guarantor').map(row => row[3]),
-      'Guarantor 2 Cooperator ID': intentData.filter(row => row[6] === 'Guarantor').map(row => row[2]),
-      'Guarantor 2 Email': intentData.filter(row => row[6] === 'Guarantor').map(row => row[5]),
-      'Guarantor 2 Phone': intentData.filter(row => row[6] === 'Guarantor').map(row => row[4]),
-      'Approver ID': controlData.filter(row => row[38]).map(row => row[38]),
-      'Approver Name': controlData.filter(row => row[37]).map(row => row[37]),
-      'Approver Email': controlData.filter(row => row[39]).map(row => row[39]),
-      'Approver Phone': controlData.filter(row => row[40]).map(row => row[40])
+      'Cooperator ID': intentData.filter(row => row[6] === ROLE_APPLICANT).map(row => row[2]),
+      'Name': intentData.filter(row => row[6] === ROLE_APPLICANT).map(row => row[3]),
+      'Phone': intentData.filter(row => row[6] === ROLE_APPLICANT).map(row => row[4]),
+      'Email': intentData.filter(row => row[6] === ROLE_APPLICANT).map(row => row[5]),
+      'Guarantor 1 Name': intentData.filter(row => row[6] === ROLE_GUARANTOR).map(row => row[3]),
+      'Guarantor 1 Cooperator ID': intentData.filter(row => row[6] === ROLE_GUARANTOR).map(row => row[2]),
+      'Guarantor 1 Email': intentData.filter(row => row[6] === ROLE_GUARANTOR).map(row => row[5]),
+      'Guarantor 1 Phone': intentData.filter(row => row[6] === ROLE_GUARANTOR).map(row => row[4]),
+      'Guarantor 2 Name': intentData.filter(row => row[6] === ROLE_GUARANTOR).map(row => row[3]),
+      'Guarantor 2 Cooperator ID': intentData.filter(row => row[6] === ROLE_GUARANTOR).map(row => row[2]),
+      'Guarantor 2 Email': intentData.filter(row => row[6] === ROLE_GUARANTOR).map(row => row[5]),
+      'Guarantor 2 Phone': intentData.filter(row => row[6] === ROLE_GUARANTOR).map(row => row[4]),
+      'Approver ID': controlData.map(row => row[getColumnIndex(controlSheet, 'FinanceOfficerID') - 1]).filter(id => id),
+      'Approver Name': controlData.map(row => row[getColumnIndex(controlSheet, 'FinanceOfficerName') - 1]).filter(name => name),
+      'Approver Email': controlData.map(row => row[getColumnIndex(controlSheet, 'FinanceOfficerEmail') - 1]).filter(email => email),
+      'Approver Phone': controlData.map(row => row[getColumnIndex(controlSheet, 'FinanceOfficerPhone') - 1]).filter(phone => phone)
     };
-
     items.forEach(item => {
-      const title = item.getTitle(); // Question name
+      const title = item.getTitle();
       if (fieldMap[title] && item.asListItem()) {
-        item.asListItem().setChoiceValues(fieldMap[title]); // Set choices
+        item.asListItem().setChoiceValues([...new Set(fieldMap[title])]);
       }
     });
+    logAction('Sync', 'Updated Application Form dropdowns');
   } catch (e) {
-    Logger.log(`Error syncing participant details: ${e.message}`);
+    logAction('Error', `Failed to sync dropdowns: ${e.message}`);
   }
 }
 
 /**
- * Handles Intent Form submissions, like adding new sign-up notes.
- * @param {GoogleAppsScript.Forms.FormSubmitEvent} e The form event.
+ * Handles Intent Form submissions.
+ * @param {GoogleAppsScript.Forms.FormSubmitEvent} e Form submission event.
  */
 function onIntentFormSubmit(e) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LOAN_INTENT_SHEET_NAME); // Intent page
-  const formResponses = e.namedValues; // Form answers
+  const intentSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LOAN_INTENT_SHEET_NAME);
+  if (!intentSheet) {
+    logAction('Error', 'Intent sheet not found');
+    return;
+  }
+  if (!e) {
+    logAction('Error', 'Form submission event is undefined');
+    return;
+  }
+  Logger.log(JSON.stringify(e));
+  if (!e.namedValues) {
+    logAction('Error', `No namedValues in event: ${JSON.stringify(e)}`);
+    return;
+  }
+  const responses = e.namedValues;
+  const applicant = {
+    id: responses['Your Cooperator ID']?.[0] || '',
+    name: responses['Your Name']?.[0] || '',
+    phone: responses['Your Phone']?.[0] || '',
+    email: responses['Your Email']?.[0] || ''
+  };
+  const guarantor1 = {
+    id: responses['Guarantor 1 Cooperator ID']?.[0] || '',
+    name: responses['Guarantor 1 Name']?.[0] || '',
+    phone: responses['Guarantor 1 Phone']?.[0] || '',
+    email: responses['Guarantor 1 Email']?.[0] || ''
+  };
+  const guarantor2 = {
+    id: responses['Guarantor 2 Cooperator ID']?.[0] || '',
+    name: responses['Guarantor 2 Name']?.[0] || '',
+    phone: responses['Guarantor 2 Phone']?.[0] || '',
+    email: responses['Guarantor 2 Email']?.[0] || ''
+  };
 
-  // Get answers
-  const applicantID = formResponses['Your Cooperator ID']?.[0] || '';
-  const applicantName = formResponses['Your Name']?.[0] || '';
-  const applicantPhone = formResponses['Your Phone']?.[0] || '';
-  const applicantEmail = formResponses['Your Email']?.[0] || '';
-  const guarantor1ID = formResponses['Guarantor 1 Cooperator ID']?.[0] || '';
-  const guarantor1Name = formResponses['Guarantor 1 Name']?.[0] || '';
-  const guarantor1Phone = formResponses['Guarantor 1 Phone']?.[0] || '';
-  const guarantor1Email = formResponses['Guarantor 1 Email']?.[0] || '';
-  const guarantor2ID = formResponses['Guarantor 2 Cooperator ID']?.[0] || '';
-  const guarantor2Name = formResponses['Guarantor 2 Name']?.[0] || '';
-  const guarantor2Phone = formResponses['Guarantor 2 Phone']?.[0] || '';
-  const guarantor2Email = formResponses['Guarantor 2 Email']?.[0] || '';
-
-  // Check if all answers are there
-  if (!applicantID || !applicantName || !applicantPhone || !applicantEmail ||
-      !guarantor1ID || !guarantor1Name || !guarantor1Phone || !guarantor1Email ||
-      !guarantor2ID || !guarantor2Name || !guarantor2Phone || !guarantor2Email) {
-    Logger.log('Missing answers in Intent Form');
+  if (!applicant.id || !applicant.email || !guarantor1.id || !guarantor1.email || !guarantor2.id || !guarantor2.email) {
+    logAction('Error', 'Incomplete Intent Form submission');
     return;
   }
 
-  // Make a new GroupID
   const groupID = generateGroupID();
-
-  // Add three rows: applicant, guarantor1, guarantor2
   const timestamp = new Date();
   const rows = [
-    [timestamp, groupID, applicantID, applicantName, applicantPhone, applicantEmail, 'Applicant'],
-    [timestamp, groupID, guarantor1ID, guarantor1Name, guarantor1Phone, guarantor1Email, 'Guarantor'],
-    [timestamp, groupID, guarantor2ID, guarantor2Name, guarantor2Phone, guarantor2Email, 'Guarantor']
+    [timestamp, groupID, applicant.id, applicant.name, applicant.phone, applicant.email, ROLE_APPLICANT],
+    [timestamp, groupID, guarantor1.id, guarantor1.name, guarantor1.phone, guarantor1.email, ROLE_GUARANTOR],
+    [timestamp, groupID, guarantor2.id, guarantor2.name, guarantor2.phone, guarantor2.email, ROLE_GUARANTOR]
   ];
 
-  // Check for duplicates (GroupID + CooperatorID)
-  const existingData = sheet.getDataRange().getValues().slice(1); // Skip header
-  for (const newRow of rows) {
-    const newGroupID = newRow[1];
-    const newCooperatorID = newRow[2];
-    if (existingData.some(row => row[1] === newGroupID && row[2] === newCooperatorID)) {
-      Logger.log(`Duplicate found: GroupID ${newGroupID}, CooperatorID ${newCooperatorID}`);
-      continue; // Skip duplicates
+  const existingData = intentSheet.getDataRange().getValues().slice(1);
+  for (const row of rows) {
+    if (existingData.some(r => r[1] === row[1] && r[2] === row[2])) {
+      logAction('Error', `Duplicate entry: GroupID=${row[1]}, CooperatorID=${row[2]}`);
+      continue;
     }
-    sheet.appendRow(newRow); // Add new row
+    intentSheet.appendRow(row);
   }
 
-  // Create a placeholder row in Control sheet
   const controlSheet = getControlSheet();
-  controlSheet.appendRow([groupID, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 'PendingFinanceOfficer', 'FALSE', timestamp]);
+  controlSheet.appendRow([
+    groupID, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 'PendingFinanceOfficer', 'FALSE', timestamp, '',
+    '', '', '', '', '', '', '', '', '', '', '', '', 'FALSE'
+  ]);
 
-  // Send one email to applicant with GroupID
-  const prefillApplicantLink = generatePrefilledLink(groupID, ROLE_APPLICANT, applicantEmail);
+  autoAssignFinanceOfficer(groupID);
+
+  const prefillLink = generatePrefilledLink(groupID, ROLE_APPLICANT, applicant.email);
   const intentData = {
     'GroupID': groupID,
-    'Applicant Name': applicantName,
-    'Applicant Cooperator ID': applicantID,
-    'Applicant Email': applicantEmail,
-    'Applicant Phone': applicantPhone,
-    'Guarantor 1 Name': guarantor1Name,
-    'Guarantor 1 Cooperator ID': guarantor1ID,
-    'Guarantor 1 Email': guarantor1Email,
-    'Guarantor 1 Phone': guarantor1Phone,
-    'Guarantor 2 Name': guarantor2Name,
-    'Guarantor 2 Cooperator ID': guarantor2ID,
-    'Guarantor 2 Email': guarantor2Email,
-    'Guarantor 2 Phone': guarantor2Phone
+    'Applicant Name': applicant.name,
+    'Applicant Cooperator ID': applicant.id,
+    'Applicant Email': applicant.email,
+    'Applicant Phone': applicant.phone,
+    'Guarantor 1 Name': guarantor1.name,
+    'Guarantor 1 Cooperator ID': guarantor1.id,
+    'Guarantor 1 Email': guarantor1.email,
+    'Guarantor 1 Phone': guarantor1.phone,
+    'Guarantor 2 Name': guarantor2.name,
+    'Guarantor 2 Cooperator ID': guarantor2.id,
+    'Guarantor 2 Email': guarantor2.email,
+    'Guarantor 2 Phone': guarantor2.phone
   };
   const intentTable = buildHtmlTableFromObject(intentData);
-  sendEmail(applicantEmail,
+  sendEmail(
+    applicant.email,
     `Loan Intent Submitted - ${groupID}`,
-    `<p>Dear ${applicantName},</p><p>Thank you for your submission. Your loan intent (GroupID: ${groupID}) has been received.</p>
-    ${intentTable}
-    <p>Please wait for an admin to assign a Finance Officer before proceeding: <a href="${prefillApplicantLink}">Loan Application Form</a></p>`);
+    `<p>Dear ${applicant.name},</p><p>Your loan intent (GroupID: ${groupID}) has been received. Please wait for Finance Officer assignment before proceeding.</p>${intentTable}<p>Application Form: <a href="${prefillLink}">Click here</a></p>`
+  );
+  logAction('Intent', `Submitted: GroupID=${groupID}`);
 }
 
 /**
- * Handles Application Form submissions, like adding loan details.
- * @param {GoogleAppsScript.Events.FormsOnSubmit} e The form event.
+ * Handles Application Form submissions.
+ * @param {GoogleAppsScript.Forms.FormSubmitEvent} e Form submission event.
  */
 function onApplicationFormSubmit(e) {
-  const sheet = getControlSheet(); // Open Control tab
-  const formResponses = e.namedValues; // Get answers
+  const sheet = getControlSheet();
+  const responses = e.namedValues;
+  const role = responses['Role']?.[0] || '';
+  let groupID = responses['Loan ID']?.[0] || '';
+  const data = {
+    applicantId: responses['Cooperator ID']?.[0] || '',
+    applicantName: responses['Name']?.[0] || '',
+    applicantEmail: responses['Email']?.[0] || '',
+    applicantPhone: responses['Phone']?.[0] || '',
+    homeAddress: responses['Home Address']?.[0] || '',
+    loanAmountFigures: responses['Loan Amount (Figures)']?.[0] || '',
+    loanAmountWords: responses['Loan Amount (Words)']?.[0] || '',
+    repaymentPeriod: responses['Repayment Period']?.[0] || '',
+    bankName: responses['Bank Name']?.[0] || '',
+    accountName: responses['Account Name']?.[0] || '',
+    accountNumber: responses['Account Number']?.[0] || '',
+    guarantor1Name: responses['Guarantor 1 Name']?.[0] || '',
+    guarantor1Id: responses['Guarantor 1 Cooperator ID']?.[0] || '',
+    guarantor1Email: responses['Guarantor 1 Email']?.[0] || '',
+    guarantor1Phone: responses['Guarantor 1 Phone']?.[0] || '',
+    guarantor2Name: responses['Guarantor 2 Name']?.[0] || '',
+    guarantor2Id: responses['Guarantor 2 Cooperator ID']?.[0] || '',
+    guarantor2Email: responses['Guarantor 2 Email']?.[0] || '',
+    guarantor2Phone: responses['Guarantor 2 Phone']?.[0] || '',
+    approverName: responses['Approver Name']?.[0] || '',
+    approverId: responses['Approver ID']?.[0] || '',
+    approverEmail: responses['Approver Email']?.[0] || '',
+    approverPhone: responses['Approver Phone']?.[0] || '',
+    status: responses['Status']?.[0] || '',
+    applicantBalance: responses['Applicant Balance']?.[0] || '',
+    applicantRating: responses['Applicant Rating']?.[0] || '',
+    guarantor1Balance: responses['Guarantor 1 Balance']?.[0] || '',
+    guarantor1Rating: responses['Guarantor 1 Rating']?.[0] || '',
+    guarantor2Balance: responses['Guarantor 2 Balance']?.[0] || '',
+    guarantor2Rating: responses['Guarantor 2 Rating']?.[0] || '',
+    comments: responses['Comments']?.[0] || ''
+  };
 
-  // Get answers
-  const role = formResponses['Role']?.[0] || '';
-  let groupID = formResponses['Loan ID']?.[0] || '';
-  const applicantID = formResponses['Cooperator ID']?.[0] || '';
-  const applicantName = formResponses['Name']?.[0] || '';
-  const applicantPhone = formResponses['Phone']?.[0] || '';
-  const applicantEmail = formResponses['Email']?.[0] || '';
-  const applicantAddress = formResponses['Home Address']?.[0] || '';
-  const loanAmountFigures = formResponses['Loan Amount (Figures)']?.[0] || '';
-  const loanAmountWords = formResponses['Loan Amount (Words)']?.[0] || '';
-  const loanDuration = formResponses['Repayment Period']?.[0] || '';
-  const bankName = formResponses['Bank Name']?.[0] || '';
-  const accountName = formResponses['Account Name']?.[0] || '';
-  const accountNumber = formResponses['Account Number']?.[0] || '';
-  const guarantor1Name = formResponses['Guarantor 1 Name']?.[0] || '';
-  const guarantor1ID = formResponses['Guarantor 1 Cooperator ID']?.[0] || '';
-  const guarantor1Email = formResponses['Guarantor 1 Email']?.[0] || '';
-  const guarantor1Phone = formResponses['Guarantor 1 Phone']?.[0] || '';
-  const guarantor2Name = formResponses['Guarantor 2 Name']?.[0] || '';
-  const guarantor2ID = formResponses['Guarantor 2 Cooperator ID']?.[0] || '';
-  const guarantor2Email = formResponses['Guarantor 2 Email']?.[0] || '';
-  const guarantor2Phone = formResponses['Guarantor 2 Phone']?.[0] || '';
-  const approverName = formResponses['Approver Name']?.[0] || '';
-  const approverID = formResponses['Approver ID']?.[0] || '';
-  const approverEmail = formResponses['Approver Email']?.[0] || '';
-  const approverPhone = formResponses['Approver Phone']?.[0] || '';
-  const decision = formResponses['Status']?.[0] || '';
-  const applicantBalance = formResponses['Applicant Balance']?.[0] || '';
-  const applicantRating = formResponses['Applicant Rating']?.[0] || '';
-  const guarantor1Balance = formResponses['Guarantor 1 Balance']?.[0] || '';
-  const guarantor1Rating = formResponses['Guarantor 1 Rating']?.[0] || '';
-  const guarantor2Balance = formResponses['Guarantor 2 Balance']?.[0] || '';
-  const guarantor2Rating = formResponses['Guarantor 2 Rating']?.[0] || '';
-  const comments = formResponses['Comments']?.[0] || '';
-
-  // Check if answers are complete
-  if (!role ||
-      (role === ROLE_APPLICANT && (!applicantID || !applicantEmail || !applicantPhone || !applicantAddress || !loanAmountFigures || !loanAmountWords || !loanDuration || !guarantor1ID || !guarantor1Email || !guarantor2ID || !guarantor2Email)) ||
-      (role === ROLE_GUARANTOR1 && (!guarantor1ID || !guarantor1Email || !guarantor1Phone || !guarantor1Name)) ||
-      (role === ROLE_GUARANTOR2 && (!guarantor2ID || !guarantor2Email || !guarantor2Phone || !guarantor2Name)) ||
-      (role === ROLE_FINANCE && (!approverID || !approverEmail || !approverPhone || !decision))) {
-    Logger.log(`Missing answers: Role=${role}, GroupID=${groupID}`);
+  if (!role || (role === ROLE_APPLICANT && !data.applicantId) || (role === ROLE_GUARANTOR && (!data.guarantor1Id || !data.guarantor2Id)) || (role === ROLE_FINANCE && !data.approverId)) {
+    logAction('Error', `Incomplete Application Form data: Role=${role}, GroupID=${groupID}`);
     return;
   }
 
-  // Check if Finance Officer is assigned
   if (role === ROLE_APPLICANT && !checkFinanceOfficerExists(groupID)) {
-    sendEmail(applicantEmail,
-      `Loan Application Blocked - No Finance Officer`,
-      `<p>Dear ${applicantName},</p><p>Sorry for any inconvenience. No Finance Officer is assigned for GroupID ${groupID}. Please wait or contact an admin.</p>`);
-    Logger.log(`Blocked submission: No Finance Officer for ${groupID}`);
+    sendEmail(data.applicantEmail, `Submission Blocked - ${groupID}`, `<p>Dear ${data.applicantName},</p><p>No Finance Officer assigned for GroupID: ${groupID}. Please contact the admin.</p>`);
+    logAction('Error', `Blocked: No Finance Officer for GroupID: ${groupID}`);
     return;
   }
 
-  // Get Finance Officer details
-  const financeOfficer = getFinanceOfficer(groupID);
-  const approverDetails = financeOfficer || { name: '', id: '', email: '', phone: '' };
+  const financeOfficer = getFinanceOfficer(groupID) || { name: '', id: '', email: '', phone: '' };
+  const controlData = sheet.getDataRange().getValues();
+  const cols = {
+    groupID: getColumnIndex(sheet, 'GroupID'),
+    cooperatorID: getColumnIndex(sheet, 'CooperatorID'),
+    status: getColumnIndex(sheet, 'ApplicationStatus'),
+    locked: getColumnIndex(sheet, 'Locked'),
+    notified: getColumnIndex(sheet, 'Notified')
+  };
+  let rowIndex = controlData.findIndex(row => row[cols.groupID - 1] === groupID) + 1;
 
-  const data = sheet.getDataRange().getValues(); // Read Control tab
-  let rowIndex = -1;
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][0] === groupID) {
-      rowIndex = i + 1;
-      break;
-    }
-  }
-
-  // Handle Applicant submission
   if (role === ROLE_APPLICANT) {
-    for (let i = 1; i < data.length; i++) {
-      if (data[i][1] === applicantID && !['FinanceReviewed', 'Expired'].includes(data[i][24])) {
-        sendEmail(applicantEmail,
-          `Active Application Denied - ${data[i][0]}`,
-          `<p>Dear ${applicantName},</p><p>Sorry for any inconvenience. You have an active loan (GroupID: ${data[i][0]}). Contact an admin to reset.</p>`);
-        Logger.log(`Blocked: Active GroupID=${data[i][0]}`);
-        return;
-      }
-    }
-    if (!groupID || rowIndex === -1) {
-      groupID = generateGroupID(); // New loan
-    } else if (sheet.getRange(rowIndex, 26).getValue() === 'TRUE') {
-      sendEmail(applicantEmail,
-        `Submission Locked - ${groupID}`,
-        `<p>Dear ${applicantName},</p><p>Sorry for any inconvenience. Application (GroupID: ${groupID}) is locked. Contact an admin.</p>`);
-      Logger.log(`Blocked re-edit for GroupID ${groupID}`);
+    if (controlData.some(row => row[cols.cooperatorID - 1] === data.applicantId && !['FinanceReviewed', 'Expired'].includes(row[cols.status - 1]))) {
+      sendEmail(data.applicantEmail, `Submission Blocked - Active Loan`, `<p>Dear ${data.applicantName},</p><p>You have an active loan application. Please contact the admin.</p>`);
+      logAction('Error', `Blocked: Active loan for CooperatorID: ${data.applicantId}`);
       return;
     }
-    const newRow = [
-      groupID, applicantID, applicantName, applicantEmail, applicantPhone, applicantAddress,
-      loanAmountFigures, loanAmountWords, loanDuration,
-      guarantor1Name, guarantor1ID, guarantor1Email, guarantor1Phone,
-      guarantor2Name, guarantor2ID, guarantor2Email, guarantor2Phone,
-      approverName, approverID, approverEmail, approverPhone, decision,
-      '', '', 'ApplicantSubmitted', 'FALSE', new Date(),
-      comments, bankName, accountName, accountNumber,
-      applicantBalance, applicantRating, guarantor1Balance, guarantor1Rating,
-      guarantor2Balance, guarantor2Rating,
-      approverDetails.name, approverDetails.id, approverDetails.email, approverDetails.phone
-    ];
-    if (rowIndex === -1) {
-      sheet.appendRow(newRow); // Add new loan
-      rowIndex = sheet.getLastRow();
-    } else {
-      sheet.getRange(rowIndex, 1, 1, 40).setValues([newRow]); // Update existing
-    }
-  } else if (role === ROLE_GUARANTOR1 || role === ROLE_GUARANTOR2) {
-    if (!groupID || rowIndex === -1) {
-      Logger.log(`Guarantor submission without GroupID: ${role}`);
+    if (!groupID || rowIndex === 0) {
+      groupID = generateGroupID();
+      rowIndex = sheet.getLastRow() + 1;
+    } else if (sheet.getRange(rowIndex, cols.locked).getValue() === 'TRUE') {
+      sendEmail(data.applicantEmail, `Application Locked - ${groupID}`, `<p>Dear ${data.applicantName},</p><p>Application ${groupID} is locked. Please contact the admin.</p>`);
+      logAction('Error', `Blocked: Application locked for GroupID: ${groupID}`);
       return;
     }
-    if (sheet.getRange(rowIndex, 26).getValue() === 'TRUE') {
-      sendEmail(role === ROLE_GUARANTOR1 ? guarantor1Email : guarantor2Email,
-        `Submission Locked - ${groupID}`,
-        `<p>Dear ${role === ROLE_GUARANTOR1 ? guarantor1Name : guarantor2Name},</p><p>Sorry for any inconvenience. Application (GroupID: ${groupID}) is locked. Contact an admin.</p>`);
-      Logger.log(`Blocked guarantor for GroupID ${groupID}`);
+    const newRow = Array(41).fill('');
+    Object.keys(data).forEach(key => {
+      const colName = key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
+      try {
+        const col = getColumnIndex(sheet, colName);
+        newRow[col - 1] = data[key];
+      } catch (e) {}
+    });
+    newRow[cols.groupID - 1] = groupID;
+    newRow[cols.cooperatorID - 1] = data.applicantId;
+    newRow[cols.status - 1] = 'ApplicantSubmitted';
+    newRow[cols.locked - 1] = 'FALSE';
+    newRow[cols.notified - 1] = 'TRUE';
+    newRow[getColumnIndex(sheet, 'Timestamp') - 1] = new Date();
+    newRow[getColumnIndex(sheet, 'FinanceOfficerName') - 1] = financeOfficer.name;
+    newRow[getColumnIndex(sheet, 'FinanceOfficerID') - 1] = financeOfficer.id;
+    newRow[getColumnIndex(sheet, 'FinanceOfficerEmail') - 1] = financeOfficer.email;
+    newRow[getColumnIndex(sheet, 'FinanceOfficerPhone') - 1] = financeOfficer.phone;
+    sheet.getRange(rowIndex, 1, 1, 41).setValues([newRow]);
+  } else if (role === ROLE_GUARANTOR) {
+    if (!groupID || rowIndex === 0) {
+      logAction('Error', `No GroupID for Role: ${role}`);
       return;
     }
-    const guarantorData = role === ROLE_GUARANTOR1
-      ? { name: guarantor1Name, id: guarantor1ID, email: guarantor1Email, phone: guarantor1Phone, col: 10 }
-      : { name: guarantor2Name, id: guarantor2ID, email: guarantor2Email, phone: guarantor2Phone, col: 14 };
-    sheet.getRange(rowIndex, guarantorData.col, 1, 4).setValues([[
-      guarantorData.name, guarantorData.id, guarantorData.email, guarantorData.phone
+    if (sheet.getRange(rowIndex, cols.locked).getValue() === 'TRUE') {
+      sendEmail(data.guarantor1Email || data.guarantor2Email, `Application Locked - ${groupID}`, `<p>Dear ${data.guarantor1Name || data.guarantor2Name},</p><p>Application ${groupID} is locked.</p>`);
+      logAction('Error', `Blocked: ${role} submission for GroupID: ${groupID}`);
+      return;
+    }
+    const guarantorNum = data.guarantor1Email === responses['Email']?.[0] ? '1' : '2';
+    sheet.getRange(rowIndex, getColumnIndex(sheet, `Guarantor${guarantorNum}Name`), 1, 4).setValues([[
+      data[`guarantor${guarantorNum}Name`], data[`guarantor${guarantorNum}Id`], 
+      data[`guarantor${guarantorNum}Email`], data[`guarantor${guarantorNum}Phone`]
     ]]);
+    sheet.getRange(rowIndex, cols.notified).setValue('TRUE');
   } else if (role === ROLE_FINANCE) {
-    if (!groupID || rowIndex === -1) {
-      Logger.log(`Finance submission without GroupID: ${role}`);
+    if (!groupID || rowIndex === 0) {
+      logAction('Error', `No GroupID for Role: ${role}`);
       return;
     }
-    if (sheet.getRange(rowIndex, 26).getValue() === 'TRUE') {
-      Logger.log(`Submission locked for GroupID ${groupID}, Role ${role}`);
+    if (sheet.getRange(rowIndex, cols.locked).getValue() === 'TRUE') {
+      logAction('Error', `Blocked: ${role} submission for GroupID: ${groupID}`);
       return;
     }
-    sheet.getRange(rowIndex, 18, 1, 23).setValues([[
-      approverName, approverID, approverEmail, approverPhone, decision,
-      '', '', '', '', '', '', comments,
-      bankName, accountName, accountNumber,
-      applicantBalance, applicantRating, guarantor1Balance, guarantor1Rating,
-      guarantor2Balance, guarantor2Rating,
-      approverDetails.name, approverDetails.id
-    ]]);
-    sheet.getRange(rowIndex, 25).setValue('FinanceReviewed');
-    sheet.getRange(rowIndex, 26).setValue('TRUE');
+    const fields = ['ApproverName', 'ApproverID', 'ApproverEmail', 'ApproverPhone', 'Status', 'Comments', 'BankName', 
+                    'AccountName', 'AccountNumber', 'ApplicantBalance', 'ApplicantRating', 'Guarantor1Balance', 
+                    'Guarantor1Rating', 'Guarantor2Balance', 'Guarantor2Rating'];
+    const values = fields.map(field => data[field.toLowerCase()] || '');
+    sheet.getRange(rowIndex, getColumnIndex(sheet, 'ApproverName'), 1, fields.length).setValues([values]);
+    sheet.getRange(rowIndex, cols.status).setValue('FinanceReviewed');
+    sheet.getRange(rowIndex, cols.locked).setValue('TRUE');
+    sheet.getRange(rowIndex, cols.notified).setValue('TRUE');
   } else {
-    Logger.log(`Invalid role: ${role}`);
+    logAction('Error', `Invalid role: ${role}`);
     return;
   }
 
-  // Make links for everyone
-  const prefillApplicantLink = generatePrefilledLink(groupID, ROLE_APPLICANT, applicantEmail);
-  const prefillGuarantor1Link = generatePrefilledLink(groupID, ROLE_GUARANTOR1, guarantor1Email);
-  const prefillGuarantor2Link = generatePrefilledLink(groupID, ROLE_GUARANTOR2, guarantor2Email);
-  const prefillFinanceLink = generatePrefilledLink(groupID, ROLE_FINANCE, approverDetails.email);
-  sheet.getRange(rowIndex, 23, 1, 2).setValues([[prefillApplicantLink, prefillFinanceLink]]);
+  const links = {
+    applicant: generatePrefilledLink(groupID, ROLE_APPLICANT, data.applicantEmail),
+    guarantor1: generatePrefilledLink(groupID, ROLE_GUARANTOR, data.guarantor1Email),
+    guarantor2: generatePrefilledLink(groupID, ROLE_GUARANTOR, data.guarantor2Email),
+    finance: generatePrefilledLink(groupID, ROLE_FINANCE, financeOfficer.email)
+  };
+  sheet.getRange(rowIndex, getColumnIndex(sheet, 'ApplicantLink'), 1, 2).setValues([[links.applicant, links.finance]]);
 
-  // Prepare tables for emails
-  const guarantor1Data = {
+  const emailData = {
     'Loan ID': groupID,
-    'Applicant Cooperator ID': applicantID,
-    'Applicant Name': applicantName,
-    'Applicant Phone': applicantPhone,
-    'Applicant Home Address': applicantAddress,
-    'Loan Amount (Figures)': loanAmountFigures,
-    'Loan Amount (Words)': loanAmountWords,
-    'Repayment Period': loanDuration,
-    'Guarantor1 ID': guarantor1ID,
-    'Status': sheet.getRange(rowIndex, 25).getValue()
+    'Applicant Name': data.applicantName,
+    'Applicant Cooperator ID': data.applicantId,
+    'Applicant Email': data.applicantEmail,
+    'Applicant Phone': data.applicantPhone,
+    'Home Address': data.homeAddress,
+    'Loan Amount (Figures)': data.loanAmountFigures,
+    'Loan Amount (Words)': data.loanAmountWords,
+    'Repayment Period': data.repaymentPeriod,
+    'Bank Name': data.bankName,
+    'Account Name': data.accountName,
+    'Account Number': data.accountNumber,
+    'Guarantor 1 Name': data.guarantor1Name,
+    'Guarantor 1 Cooperator ID': data.guarantor1Id,
+    'Guarantor 1 Email': data.guarantor1Email,
+    'Guarantor 1 Phone': data.guarantor1Phone,
+    'Guarantor 2 Name': data.guarantor2Name,
+    'Guarantor 2 Cooperator ID': data.guarantor2Id,
+    'Guarantor 2 Email': data.guarantor2Email,
+    'Guarantor 2 Phone': data.guarantor2Phone,
+    'Status': data.status || 'Pending'
   };
-  const guarantor2Data = {
-    'Loan ID': groupID,
-    'Applicant Cooperator ID': applicantID,
-    'Applicant Name': applicantName,
-    'Applicant Phone': applicantPhone,
-    'Applicant Home Address': applicantAddress,
-    'Loan Amount (Figures)': loanAmountFigures,
-    'Loan Amount (Words)': loanAmountWords,
-    'Repayment Period': loanDuration,
-    'Guarantor2 ID': guarantor2ID,
-    'Status': sheet.getRange(rowIndex, 25).getValue()
-  };
-  const financeData = {
-    'Loan ID': groupID,
-    'Applicant Cooperator ID': applicantID,
-    'Applicant Name': applicantName,
-    'Applicant Email': applicantEmail,
-    'Applicant Phone': applicantPhone,
-    'Applicant Home Address': applicantAddress,
-    'Loan Amount (Figures)': loanAmountFigures,
-    'Loan Amount (Words)': loanAmountWords,
-    'Repayment Period': loanDuration,
-    'Bank Name': bankName,
-    'Account Name': accountName,
-    'Account Number': accountNumber,
-    'Guarantor1 Name': guarantor1Name,
-    'Guarantor1 ID': guarantor1ID,
-    'Guarantor1 Email': guarantor1Email,
-    'Guarantor1 Phone': guarantor1Phone,
-    'Guarantor2 Name': guarantor2Name,
-    'Guarantor2 ID': guarantor2ID,
-    'Guarantor2 Email': guarantor2Email,
-    'Guarantor2 Phone': guarantor2Phone,
-    'Approver Name': approverName,
-    'Approver ID': approverID,
-    'Approver Email': approverEmail,
-    'Approver Phone': approverPhone,
-    'Applicant Balance': applicantBalance,
-    'Applicant Rating': applicantRating,
-    'Guarantor1 Balance': guarantor1Balance,
-    'Guarantor1 Rating': guarantor1Rating,
-    'Guarantor2 Balance': guarantor2Balance,
-    'Guarantor2 Rating': guarantor2Rating,
-    'Status': decision || 'Pending',
-    'Comments': comments
-  };
-  const guarantor1Table = buildHtmlTableFromObject(guarantor1Data);
-  const guarantor2Table = buildHtmlTableFromObject(guarantor2Data);
-  const financeTable = buildHtmlTableFromObject(financeData);
+  const table = buildHtmlTableFromObject(emailData);
 
-  // Send emails based on role with polite phrasing
   switch (role) {
     case ROLE_APPLICANT:
-      let recipient = applicantEmail;
-      let subject = `Loan Application Submitted - ${groupID}`;
-      let htmlBody = `<p>Dear ${applicantName},</p><p>Thank you for submitting your loan application (GroupID: ${groupID}).</p>
-        ${financeTable}
-        <p>Your guarantors and the Finance Officer have been notified. Please use this link to edit your submission if needed: <a href="${prefillApplicantLink}">Edit Application</a></p>
-        <p>Please note that guarantors and the Finance Officer must respond within ${REMINDER_DAYS_LIMIT} days.</p>`;
-      sendEmail(recipient, subject, htmlBody);
-
-      recipient = guarantor1Email;
-      subject = `Action Needed: Guarantor Details - ${groupID}`;
-      htmlBody = `<p>Dear ${guarantor1Name},</p><p>Kindly submit your details promptly as Guarantor 1 for ${applicantName}’s loan (GroupID: ${groupID}).</p>
-        ${guarantor1Table}
-        <p>Please complete within ${REMINDER_DAYS_LIMIT} days: <a href="${prefillGuarantor1Link}">Complete Details</a></p>`;
-      sendEmail(recipient, subject, htmlBody);
-
-      recipient = guarantor2Email;
-      subject = `Action Needed: Guarantor Details - ${groupID}`;
-      htmlBody = `<p>Dear ${guarantor2Name},</p><p>Kindly submit your details promptly as Guarantor 2 for ${applicantName}’s loan (GroupID: ${groupID}).</p>
-        ${guarantor2Table}
-        <p>Please complete within ${REMINDER_DAYS_LIMIT} days: <a href="${prefillGuarantor2Link}">Complete Details</a></p>`;
-      sendEmail(recipient, subject, htmlBody);
-
-      if (approverDetails.email) {
-        subject = `Review Loan Application - ${groupID}`;
-        htmlBody = `<p>Dear ${approverDetails.name},</p><p>Thank you for serving as Finance Officer. Kindly review ${applicantName}’s loan application (GroupID: ${groupID}) at your earliest convenience.</p>
-          ${financeTable}
-          <p>Please complete your review within ${REMINDER_DAYS_LIMIT} days: <a href="${prefillFinanceLink}">Review Application</a></p>`;
-        sendEmail(approverDetails.email, subject, htmlBody);
+      sendEmail(data.applicantEmail, `Application Submitted - ${groupID}`, 
+        `<p>Dear ${data.applicantName},</p><p>Your application (GroupID: ${groupID}) has been submitted.</p>${table}<p>Edit: <a href="${links.applicant}">Click here</a></p>`);
+      sendEmail(data.guarantor1Email, `Action Required - ${groupID}`, 
+        `<p>Dear ${data.guarantor1Name},</p><p>Please submit details for ${data.applicantName}'s loan (GroupID: ${groupID}).</p>${table}<p><a href="${links.guarantor1}">Submit</a></p>`);
+      sendEmail(data.guarantor2Email, `Action Required - ${groupID}`, 
+        `<p>Dear ${data.guarantor2Name},</p><p>Please submit details for ${data.applicantName}'s loan (GroupID: ${groupID}).</p>${table}<p><a href="${links.guarantor2}">Submit</a></p>`);
+      if (financeOfficer.email) {
+        sendEmail(financeOfficer.email, `Review Application - ${groupID}`, 
+          `<p>Dear ${financeOfficer.name},</p><p>Please review ${data.applicantName}'s loan application (GroupID: ${groupID}).</p>${table}<p><a href="${links.finance}">Review</a></p>`);
       }
       break;
-
-    case ROLE_GUARANTOR1:
-    case ROLE_GUARANTOR2:
-      const guarantorName = role === ROLE_GUARANTOR1 ? guarantor1Name : guarantor2Name;
-      const guarantorEmail = role === ROLE_GUARANTOR1 ? guarantor1Email : guarantor2Email;
-      const guarantorTable = role === ROLE_GUARANTOR1 ? guarantor1Table : guarantor2Table;
-      [applicantEmail, approverDetails.email].filter(email => email).forEach(email => {
-        sendEmail(email,
-          `Guarantor Details Submitted - ${groupID}`,
-          `<p>Dear ${email === applicantEmail ? applicantName : approverDetails.name},</p><p>Thank you for your involvement. ${guarantorName} (${role}) has submitted details for GroupID: ${groupID}.</p>
-          ${financeTable}`);
+    case ROLE_GUARANTOR:
+      const guarantorNum = data.guarantor1Email === responses['Email']?.[0] ? '1' : '2';
+      const gName = guarantorNum === '1' ? data.guarantor1Name : data.guarantor2Name;
+      const gEmail = guarantorNum === '1' ? data.guarantor1Email : data.guarantor2Email;
+      sendEmail(gEmail, `Details Submitted - ${groupID}`, 
+        `<p>Dear ${gName},</p><p>Your details for ${data.applicantName}'s loan (GroupID: ${groupID}) have been submitted.</p>${table}`);
+      [data.applicantEmail, financeOfficer.email].filter(email => email).forEach(email => {
+        sendEmail(email, `Guarantor ${guarantorNum} Submitted - ${groupID}`, 
+          `<p>Dear ${email === data.applicantEmail ? data.applicantName : financeOfficer.name},</p><p>${gName} has submitted details for GroupID: ${groupID}.</p>${table}`);
       });
-      recipient = guarantorEmail;
-      subject = `Guarantor Details Submitted - ${groupID}`;
-      htmlBody = `<p>Dear ${guarantorName},</p><p>Thank you for submitting your details as ${role} for ${applicantName}’s loan (GroupID: ${groupID}).</p>
-        ${guarantorTable}`;
-      sendEmail(recipient, subject, htmlBody);
       break;
-
     case ROLE_FINANCE:
-      const recipients = [applicantEmail, guarantor1Email, guarantor2Email].filter(email => email);
-      subject = `Loan Application Reviewed - ${groupID}`;
-      recipients.forEach(recipientEmail => {
-        if (recipientEmail === applicantEmail || recipientEmail === approverDetails.email) {
-          htmlBody = `<p>Dear ${recipientEmail === applicantEmail ? applicantName : approverDetails.name},</p><p>Thank you for your participation. The loan application (GroupID: ${groupID}) has been reviewed by ${approverDetails.name}.</p>
-          ${financeTable}<p>Status: ${financeData['Status']}</p>`;
-        } else {
-          const guarantorTable = recipientEmail === guarantor1Email ? guarantor1Table : guarantor2Table;
-          htmlBody = `<p>Dear ${recipientEmail === guarantor1Email ? guarantor1Name : guarantor2Name},</p><p>Thank you for your support. The loan application (GroupID: ${groupID}) has been reviewed by ${approverDetails.name}.</p>
-            ${guarantorTable}<p>Status: ${financeData['Status']}</p>`;
-        }
-        sendEmail(recipientEmail, subject, htmlBody);
+      [data.applicantEmail, data.guarantor1Email, data.guarantor2Email].filter(email => email).forEach(email => {
+        sendEmail(email, `Application Reviewed - ${groupID}`, 
+          `<p>Dear ${email === data.applicantEmail ? data.applicantName : email === data.guarantor1Email ? data.guarantor1Name : data.guarantor2Name},</p><p>Loan application ${groupID} has been reviewed. Status: ${data.status}.</p>${table}`);
       });
       archiveApplication(groupID);
       break;
   }
+  logAction('Application', `Submitted: GroupID=${groupID}, Role=${role}`);
 }
 
 /**
- * Sends daily reminders, like reminding friends to check their toys.
- * Only for applications with a Finance Officer and within 7 days.
+ * Sends daily reminders for pending actions.
  */
 function sendDailyReminders() {
-  const sheet = getControlSheet(); // Open Control tab
-  const data = sheet.getDataRange().getValues(); // Read all loans
-  const now = new Date(); // Today’s date
+  const sheet = getControlSheet();
+  const data = sheet.getDataRange().getValues();
+  const now = new Date();
+  let emailCount = 0;
+  const cols = {
+    groupID: getColumnIndex(sheet, 'GroupID'),
+    name: getColumnIndex(sheet, 'Name'),
+    email: getColumnIndex(sheet, 'Email'),
+    guarantor1Name: getColumnIndex(sheet, 'Guarantor1Name'),
+    guarantor1Email: getColumnIndex(sheet, 'Guarantor1Email'),
+    guarantor2Name: getColumnIndex(sheet, 'Guarantor2Name'),
+    guarantor2Email: getColumnIndex(sheet, 'Guarantor2Email'),
+    financeOfficerName: getColumnIndex(sheet, 'FinanceOfficerName'),
+    financeOfficerEmail: getColumnIndex(sheet, 'FinanceOfficerEmail'),
+    status: getColumnIndex(sheet, 'ApplicationStatus'),
+    financeLink: getColumnIndex(sheet, 'FinanceLink'),
+    timestamp: getColumnIndex(sheet, 'Timestamp')
+  };
 
-  // Process each loan
   for (let i = 1; i < data.length; i++) {
-    const row = data[i]; // Current loan
-    const groupID = row[0]; // Group ID
-    const applicantName = row[2]; // Applicant
-    const applicantEmail = row[3]; // Email
-    const guarantor1Name = row[9]; // Guarantor 1
-    const guarantor1Email = row[11]; // Email
-    const guarantor2Name = row[13]; // Guarantor 2
-    const guarantor2Email = row[15]; // Email
-    const approverName = row[37]; // Finance Officer
-    const approverEmail = row[39]; // Email
-    const status = row[24]; // Status
-    const prefillGuarantor1Link = generatePrefilledLink(groupID, ROLE_GUARANTOR1, guarantor1Email);
-    const prefillGuarantor2Link = generatePrefilledLink(groupID, ROLE_GUARANTOR2, guarantor2Email);
-    const prefillFinanceLink = row[23]; // Finance link
-    const timestamp = new Date(row[26]); // Submission time
-    const daysSince = Math.floor((now - timestamp) / (1000 * 60 * 60 * 24)); // Days passed
-
-    // Skip if no Finance Officer or already processed
-    if (!checkFinanceOfficerExists(groupID) || status !== 'ApplicantSubmitted') continue;
-
-    // Mark as expired if past 7-day limit
-    if (daysSince > REMINDER_DAYS_LIMIT) {
-      sheet.getRange(i + 1, 25).setValue('Expired'); // Mark as expired
-      sheet.getRange(i + 1, 26).setValue('TRUE'); // Lock it
-      archiveApplication(groupID); // Move to Archive
-      sendEmail(applicantEmail,
-        `Loan Application Expired - ${groupID}`,
-        `<p>Dear ${applicantName},</p><p>Sorry for any inconvenience. Your loan application (GroupID: ${groupID}) has expired due to guarantors not responding within ${REMINDER_DAYS_LIMIT} days. Please contact an admin to resubmit.</p>`);
+    const row = data[i];
+    const groupID = row[cols.groupID - 1];
+    if (!checkFinanceOfficerExists(groupID) || row[cols.status - 1] !== 'ApplicantSubmitted') continue;
+    const timestamp = new Date(row[cols.timestamp - 1]);
+    const daysSince = Math.floor((now - timestamp) / (1000 * 60 * 60 * 24));
+    if (daysSince >= REMINDER_DAYS_LIMIT) {
+      sheet.getRange(i + 1, cols.status).setValue('Expired');
+      sheet.getRange(i + 1, getColumnIndex(sheet, 'Locked')).setValue('TRUE');
+      sendEmail(row[cols.email - 1], `Application Expired - ${groupID}`, 
+        `<p>Dear ${row[cols.name - 1]},</p><p>Your application (GroupID: ${groupID}) has expired due to inactivity.</p>`);
+      archiveApplication(groupID);
+      logAction('Expired', `GroupID=${groupID}`);
       continue;
     }
-
-    // Create a reminder table
     const reminderData = {
       'Loan ID': groupID,
-      'Applicant Name': applicantName,
-      'Status': status
+      'Applicant Name': row[cols.name - 1],
+      'Status': row[cols.status - 1]
     };
-    const reminderTable = buildHtmlTableFromObject(reminderData);
-
-    // Remind Guarantor 1
-    if (guarantor1Email && prefillGuarantor1Link) {
-      sendEmail(guarantor1Email,
-        `Reminder: Guarantor Details - ${groupID}`,
-        `<p>Dear ${guarantor1Name},</p><p>Kindly submit your details promptly for ${applicantName}’s loan (GroupID: ${groupID}). Thank you for your support.</p>
-          ${reminderTable}
-          <p>Please complete within ${REMINDER_DAYS_LIMIT - daysSince} days: <a href="${prefillGuarantor1Link}">Complete Details</a></p>`);
-    }
-
-    // Remind Guarantor 2
-    if (guarantor2Email && prefillGuarantor2Link) {
-      sendEmail(guarantor2Email,
-        `Reminder: Guarantor Details - ${groupID}`,
-        `<p>Dear ${guarantor2Name},</p><p>Kindly submit your details promptly for ${applicantName}’s loan (GroupID: ${groupID}). Thank you for your support.</p>
-          ${reminderTable}
-          <p>Please complete within ${REMINDER_DAYS_LIMIT - daysSince} days: <a href="${prefillGuarantor2Link}">Complete Details</a></p>`);
-    }
-
-    // Remind Finance Officer
-    if (approverEmail && prefillFinanceLink) {
-      const financeReminderData = {
-        'Loan ID': groupID,
-        'Applicant Name': applicantName,
-        'Status': status,
-        'Applicant Cooperator ID': row[1],
-        'Applicant Email': applicantEmail,
-        'Applicant Phone': row[4],
-        'Applicant Home Address': row[5],
-        'Loan Amount (Figures)': row[6],
-        'Loan Amount (Words)': row[7],
-        'Repayment Period': row[8]
-      };
-      const financeTable = buildHtmlTableFromObject(financeReminderData);
-      sendEmail(approverEmail,
-        `Reminder: Review Loan Application - ${groupID}`,
-        `<p>Dear ${approverName},</p><p>Kindly review ${applicantName}’s loan application (GroupID: ${groupID}) at your earliest convenience. Thank you.</p>
-          ${financeTable}
-          <p>Please complete your review within ${REMINDER_DAYS_LIMIT - daysSince} days: <a href="${prefillFinanceLink}">Review Application</a></p>`);
-    }
+    const table = buildHtmlTableFromObject(reminderData);
+    const emails = [
+      { email: row[cols.guarantor1Email - 1], name: row[cols.guarantor1Name - 1], role: ROLE_GUARANTOR },
+      { email: row[cols.guarantor2Email - 1], name: row[cols.guarantor2Name - 1], role: ROLE_GUARANTOR },
+      { email: row[cols.financeOfficerEmail - 1], name: row[cols.financeOfficerName - 1], role: ROLE_FINANCE, linkCol: cols.financeLink }
+    ];
+    emails.forEach(({ email, name, role, linkCol }) => {
+      if (email && emailCount < 50) {
+        const link = linkCol ? row[linkCol - 1] : generatePrefilledLink(groupID, role, email);
+        if (link) {
+          sendEmail(email, `Reminder - ${groupID}`, 
+            `<p>Dear ${name},</p><p>${role === ROLE_FINANCE ? 'Please review' : 'Please submit details for'} loan application ${groupID}.</p>${table}<p><a href="${link}">${role === ROLE_FINANCE ? 'Review' : 'Submit'}</a></p>`);
+          emailCount++;
+        }
+      }
+    });
   }
+  logAction('Reminders', `Sent ${emailCount} reminders`);
 }
 
 /**
- * Sends notifications to newly assigned Finance Officer groups.
- * Only for groups with a Finance Officer and no application flow started.
+ * Notifies applicants of new Finance Officer assignments.
  */
 function notifyNewFinanceOfficerAssignments() {
-  const sheet = getControlSheet(); // Open Control sheet
-  const intentSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LOAN_INTENT_SHEET_NAME); // Intent sheet
-  const controlData = sheet.getDataRange().getValues().slice(1); // Skip header
-  const intentData = intentSheet.getDataRange().getValues().slice(1); // Skip header
-
-  const ui = SpreadsheetApp.getUi(); // UI for prompt
-  const response = ui.alert('Notify New Assignments',
-    'Please confirm if you want to send notifications to groups with newly assigned Finance Officers.',
-    ui.ButtonSet.YES_NO); // Prompt admin
-  if (response !== ui.Button.YES) {
-    ui.alert('Notifications cancelled.');
-    return;
-  }
-
-  let notifiedCount = 0;
-
-  // Process each loan group
-  for (let i = 0; i < controlData.length; i++) {
-    const row = controlData[i]; // Current row
-    const groupID = row[0]; // Group ID
-    const applicantName = row[2]; // Applicant name
-    const applicantEmail = row[3]; // Email
-    const status = row[24]; // Status
-    const financeOfficer = getFinanceOfficer(groupID); // Finance Officer
-
-    // Skip if no Finance Officer or application started
-    if (!financeOfficer || ['ApplicantSubmitted', 'Notified', 'FinanceReviewed', 'Expired'].includes(status)) {
-      continue;
-    }
-
-    // Get guarantor details from Intent
-    const groupIntentData = intentData.filter(row => row[1] === groupID); // Filter GroupID
-    const applicantRow = groupIntentData.find(row => row[6] === 'Applicant');
-    const guarantorRows = groupIntentData.filter(row => row[6] === 'Guarantor');
-    const guarantor1Row = guarantorRows[0]; // First Guarantor
-    const guarantor2Row = guarantorRows[1]; // Second Guarantor
-
-    if (!applicantRow || !guarantor1Row || !guarantor2Row) {
-      Logger.log(`Missing intent data for GroupID: ${groupID}`);
-      continue;
-    }
-
-    const guarantor1Name = guarantor1Row[3] || ''; // Guarantor 1 name
-    const guarantor1Email = guarantor1Row[5] || ''; // Guarantor 1 email
-    const guarantor2Name = guarantor2Row[3] || ''; // Guarantor 2 name
-    const guarantor2Email = guarantor2Row[5] || ''; // Guarantor 2 email
-
-    // Generate links
-    const prefillApplicantLink = generatePrefilledLink(groupID, ROLE_APPLICANT, applicantEmail);
-    const prefillGuarantor1Link = generatePrefilledLink(groupID, ROLE_GUARANTOR1, guarantor1Email);
-    const prefillGuarantor2Link = generatePrefilledLink(groupID, ROLE_GUARANTOR2, guarantor2Email);
-    const prefillFinanceLink = generatePrefilledLink(groupID, ROLE_FINANCE, financeOfficer.email);
-
-    // Prepare notification table
-    const notificationData = {
+  const sheet = getControlSheet();
+  const data = sheet.getDataRange().getValues();
+  const cols = {
+    groupID: getColumnIndex(sheet, 'GroupID'),
+    name: getColumnIndex(sheet, 'Name'),
+    email: getColumnIndex(sheet, 'Email'),
+    financeOfficerName: getColumnIndex(sheet, 'FinanceOfficerName'),
+    financeOfficerEmail: getColumnIndex(sheet, 'FinanceOfficerEmail'),
+    status: getColumnIndex(sheet, 'ApplicationStatus'),
+    notified: getColumnIndex(sheet, 'Notified')
+  };
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const groupID = row[cols.groupID - 1];
+    if (row[cols.notified - 1] === 'TRUE' || row[cols.status - 1] !== 'PendingFinanceOfficer' || !row[cols.financeOfficerEmail - 1]) continue;
+    const link = generatePrefilledLink(groupID, ROLE_APPLICANT, row[cols.email - 1]);
+    const table = buildHtmlTableFromObject({
       'Loan ID': groupID,
-      'Applicant Name': applicantName,
-      'Finance Officer': financeOfficer.name,
-      'Finance Officer Email': financeOfficer.email
-    };
-    const notificationTable = buildHtmlTableFromObject(notificationData);
-
-    // Notify Applicant
-    sendEmail(applicantEmail,
+      'Applicant Name': row[cols.name - 1],
+      'Finance Officer': row[cols.financeOfficerName - 1]
+    });
+    sendEmail(
+      row[cols.email - 1],
       `Finance Officer Assigned - ${groupID}`,
-      `<p>Dear ${applicantName},</p><p>Thank you for your patience. A Finance Officer has been assigned to your loan group (GroupID: ${groupID}).</p>
-        ${notificationTable}
-        <p>Please submit your application: <a href="${prefillApplicantLink}">Loan Application Form</a></p>`);
-
-    // Notify Guarantor 1
-    if (guarantor1Email) {
-      sendEmail(guarantor1Email,
-        `Finance Officer Assigned - ${groupID}`,
-        `<p>Dear ${guarantor1Name},</p><p>Thank you for your willingness to support. A Finance Officer has been assigned to ${applicantName}’s loan (GroupID: ${groupID}).</p>
-        ${notificationTable}
-        <p>Please prepare to submit your guarantor details when requested: <a href="${prefillGuarantor1Link}">Guarantor Details</a></p>`);
-    }
-
-    // Notify Guarantor 2
-    if (guarantor2Email) {
-      sendEmail(guarantor2Email,
-        `Finance Officer Assigned - ${groupID}`,
-        `<p>Dear ${guarantor2Name},</p><p>Thank you for your willingness to support. A Finance Officer has been assigned to ${applicantName}’s loan (GroupID: ${groupID}).</p>
-        ${notificationTable}
-        <p>Please prepare to submit your guarantor details when requested: <a href="${prefillGuarantor2Link}">Guarantor Details</a></p>`);
-    }
-
-    // Notify Finance Officer
-    sendEmail(financeOfficer.email,
-      `Assigned to Loan Group - ${groupID}`,
-      `<p>Dear ${financeOfficer.name},</p><p>Thank you for taking on this role. You have been assigned as Finance Officer for GroupID ${groupID} (Applicant: ${applicantName}).</p>
-        ${notificationTable}
-        <p>Please prepare to review the application within ${REMINDER_DAYS_LIMIT} days: <a href="${prefillFinanceLink}">Review Application</a></p>`);
-
-    // Update status
-    sheet.getRange(i + 2, 25).setValue('Notified');
-    Logger.log(`Sent notifications for GroupID ${groupID}`);
-    notifiedCount++;
+      `<p>Dear ${row[cols.name - 1]},</p><p>A Finance Officer has been assigned to your loan application (GroupID: ${groupID}). You may now proceed.</p>${table}<p><a href="${link}">Submit Application</a></p>`
+    );
+    sheet.getRange(i + 1, cols.notified).setValue('TRUE');
+    logAction('Notification', `Notified applicant for GroupID: ${groupID}`);
   }
-
-  ui.alert(`Success: ${notifiedCount} notifications sent to newly assigned groups!`);
 }
 
 /**
- * Moves a loan to the Archive tab, like putting away a toy.
- * @param {string} groupID The loan ID.
- * @returns {string} What happened.
+ * Archives a completed or expired application.
+ * @param {string} groupID Group ID.
  */
 function archiveApplication(groupID) {
-  const controlSheet = getControlSheet(); // Open Control sheet
-  const archiveSheet = getArchiveSheet(); // Open Archive sheet
-  const data = controlSheet.getDataRange().getValues(); // Get all loans
-
+  const controlSheet = getControlSheet();
+  const archiveSheet = getArchiveSheet();
+  const data = controlSheet.getDataRange().getValues();
+  const cols = { groupID: getColumnIndex(controlSheet, 'GroupID') };
   for (let i = 1; i < data.length; i++) {
-    if (data[i][0] === groupID && ['FinanceReviewed', 'Expired'].includes(data[i][24])) {
-      archiveSheet.appendRow(data[i]); // Add to Archive
-      controlSheet.deleteRow(i + 1); // Remove from Control
-      Logger.log(`Archived GroupID ${groupID}`);
-      return `Archived GroupID ${groupID}`;
+    if (data[i][cols.groupID - 1] === groupID) {
+      archiveSheet.appendRow(data[i]);
+      controlSheet.deleteRow(i + 1);
+      logAction('Archived', `GroupID: ${groupID}`);
+      break;
     }
   }
-  return `GroupID ${groupID} not found or not ready to archive`;
 }
 
 /**
- * Resets a loan application, like giving a toy a fresh start.
- * @param {string} groupID The loan ID.
- * @returns {string} What happened.
+ * Resets an application to PendingFinanceOfficer status.
  */
-function manualResetUnlock(groupID) {
-  const sheet = getControlSheet(); // Open Control sheet
-  const data = sheet.getDataRange().getValues(); // Read all loans
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][0] === groupID) {
-      const applicantName = data[i][2]; // Applicant name
-      const applicantEmail = data[i][3]; // Email
-      const guarantor1Name = data[i][9]; // Guarantor 1 name
-      const guarantor1Email = data[i][11]; // Email
-      const guarantor2Name = data[i][13]; // Guarantor 2 name
-      const guarantor2Email = data[i][15]; // Email
-      const approverName = data[i][37]; // Approver name
-      const approverEmail = data[i][39]; // Email
-      const guarantor1Data = {
-        'Loan ID': groupID,
-        'Applicant Cooperator ID': data[i][1],
-        'Applicant Name': applicantName,
-        'Applicant Phone': data[i][4],
-        'Applicant Home Address': data[i][5],
-        'Loan Amount (Figures)': data[i][6],
-        'Loan Amount (Words)': data[i][7],
-        'Repayment Period': data[i][8],
-        'Guarantor1 ID': data[i][10],
-        'Status': 'Pending'
-      };
-      const guarantor2Data = {
-        'Loan ID': groupID,
-        'Applicant Cooperator ID': data[i][1],
-        'Applicant Name': applicantName,
-        'Applicant Phone': data[i][4],
-        'Applicant Home Address': data[i][5],
-        'Loan Amount (Figures)': data[i][6],
-        'Loan Amount (Words)': data[i][7],
-        'Repayment Period': data[i][8],
-        'Guarantor2 ID': data[i][14],
-        'Status': 'Pending'
-      };
-      const financeData = {
-        'Loan ID': groupID,
-        'Applicant Cooperator ID': data[i][1],
-        'Applicant Name': applicantName,
-        'Applicant Email': applicantEmail,
-        'Applicant Phone': data[i][4],
-        'Applicant Home Address': data[i][5],
-        'Loan Amount (Figures)': data[i][6],
-        'Loan Amount (Words)': data[i][7],
-        'Repayment Period': data[i][8],
-        'Guarantor1 Name': guarantor1Name,
-        'Guarantor1 ID': data[i][10],
-        'Guarantor1 Email': guarantor1Email,
-        'Guarantor1 Phone': data[i][12],
-        'Guarantor2 Name': guarantor2Name,
-        'Guarantor2 ID': data[i][14],
-        'Guarantor2 Email': guarantor2Email,
-        'Guarantor2 Phone': data[i][16],
-        'Approver Name': approverName,
-        'Approver ID': data[i][38],
-        'Approver Email': approverEmail,
-        'Approver Phone': data[i][40],
-        'Status': data[i][21] || 'Pending',
-        'Comments': data[i][27]
-      };
-      const guarantor1Table = buildHtmlTableFromObject(guarantor1Data);
-      const guarantor2Table = buildHtmlTableFromObject(guarantor2Data);
-      const financeTable = buildHtmlTableFromObject(financeData);
-
-      sheet.getRange(i + 1, 25).setValue(''); // Clear status
-      sheet.getRange(i + 1, 26).setValue('FALSE'); // Unlock
-      const prefillApplicantLink = generatePrefilledLink(groupID, ROLE_APPLICANT, applicantEmail);
-      const prefillGuarantor1Link = generatePrefilledLink(groupID, ROLE_GUARANTOR1, guarantor1Email);
-      const prefillGuarantor2Link = generatePrefilledLink(groupID, ROLE_GUARANTOR2, guarantor2Email);
-      const subject = `Application Reset - ${groupID}`;
-      const recipients = [applicantEmail, guarantor1Email, guarantor2Email, approverEmail].filter(email => email);
-      recipients.forEach(recipient => {
-        let htmlBody = '';
-        if (recipient === guarantor1Email) {
-          htmlBody = `<p>Dear ${guarantor1Name},</p><p>Thank you for your involvement. Application (GroupID: ${groupID}) has been reset. Kindly resubmit: <a href="${prefillGuarantor1Link}">Complete Details</a></p>
-            ${guarantor1Table}`;
-        } else if (recipient === guarantor2Email) {
-          htmlBody = `<p>Dear ${guarantor2Name},</p><p>Thank you for your involvement. Application (GroupID: ${groupID}) has been reset. Kindly resubmit: <a href="${prefillGuarantor2Link}">Complete Details</a></p>
-            ${guarantor2Table}`;
-        } else {
-          htmlBody = `<p>Dear ${recipient === applicantEmail ? applicantName : approverName},</p><p>Thank you for your participation. Application (GroupID: ${groupID}) has been reset.</p>
-            ${financeTable}
-            <p>Applicant: <a href="${prefillApplicantLink}">Resubmit</a></p>
-            <p>Guarantor 1: <a href="${prefillGuarantor1Link}">Resubmit</a></p>
-            <p>Guarantor 2: <a href="${prefillGuarantor2Link}">Resubmit</a></p>`;
-        }
-        sendEmail(recipient, subject, htmlBody);
-      });
-      Logger.log(`Reset GroupID ${groupID}`);
-      return `Reset GroupID ${groupID}`;
-    }
+function manualReset() {
+  const ui = SpreadsheetApp.getUi();
+  const groupID = ui.prompt('Enter GroupID to reset').getResponseText();
+  const sheet = getControlSheet();
+  const data = sheet.getDataRange().getValues();
+  const cols = {
+    groupID: getColumnIndex(sheet, 'GroupID'),
+    status: getColumnIndex(sheet, 'ApplicationStatus'),
+    locked: getColumnIndex(sheet, 'Locked'),
+    notified: getColumnIndex(sheet, 'Notified'),
+    timestamp: getColumnIndex(sheet, 'Timestamp')
+  };
+  const rowIndex = data.findIndex(row => row[cols.groupID - 1] === groupID) + 1;
+  if (rowIndex === 0) {
+    ui.alert(`Error: GroupID ${groupID} not found`);
+    logAction('Error', `Reset failed for GroupID: ${groupID}`);
+    return;
   }
-  return `GroupID ${groupID} not found`;
+  sheet.getRange(rowIndex, cols.status, 1, 3).setValues([['PendingFinanceOfficer', 'FALSE', 'FALSE']]);
+  sheet.getRange(rowIndex, cols.timestamp).setValue(new Date());
+  ui.alert(`Success: GroupID ${groupID} reset to PendingFinanceOfficer`);
+  logAction('Reset', `GroupID: ${groupID}`);
 }
 
 /**
- * Adds buttons to the system, like adding controls to our toy.
+ * Creates a custom menu in the spreadsheet.
  */
-function createMenu() {
-  const ui = SpreadsheetApp.getUi(); // Get UI buttons
-  ui.createMenu('CSULMCS Loan System')
-    .addItem('Reset Application', 'showManualReset')
-    .addItem('Archive Application', 'showArchive')
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('CSULMCS Loan System')
+    .addItem('Set Up Form IDs', 'runSetUpFormIds')
+    .addItem('Set Up Triggers', 'setupTriggers')
     .addItem('Notify New Assignments', 'notifyNewFinanceOfficerAssignments')
+    .addItem('Reset Application', 'manualReset')
     .addToUi();
 }
 
 /**
- * Shows a box to reset a loan, like a reset switch.
- */
-function showManualReset() {
-  const ui = SpreadsheetApp.getUi(); // Get UI
-  const response = ui.prompt('Reset Application', 'Please enter GroupID:', ui.ButtonSet.OK_CANCEL); // Prompt for ID
-  if (response.getSelectedButton() === ui.Button.OK) {
-    const groupID = response.getResponseText().trim(); // Get ID
-    if (!groupID) {
-      ui.alert('Error: Invalid ID. Please enter a GroupID.');
-      return;
-    }
-    const result = manualResetUnlock(groupID); // Reset group
-    ui.alert(result); // Show result
-  }
-}
-
-/**
- * Shows a box to archive a loan, like storing a toy away.
- */
-function showArchive() {
-  const ui = SpreadsheetApp.getUi(); // Open UI
-  const response = ui.prompt('Archive Application', 'GroupID:', ui.ButtonSet.OK_CANCEL); // Prompt for ID
-  if (response.getSelectedButton() === ui.Button.OK) {
-    const groupID = response.getResponseText().trim(); // Get ID
-    if (!groupID) {
-      ui.alert('Error: Invalid ID. Please enter a GroupID.');
-      return;
-    }
-    const result = archiveApplication(groupID); // Archive group
-    ui.alert(result); // Show result
-  }
-}
-
-/**
- * Sets up automatic actions, like winding up the toy.
+ * Sets up triggers for the system.
  */
 function setupTriggers() {
-  try {
-    ScriptApp.getProjectTriggers().forEach(trigger => ScriptApp.deleteTrigger(trigger)); // Clear old triggers
-    // Trigger for Intent Form submissions
-    ScriptApp.newTrigger('onIntentFormSubmit')
-      .forForm(FormApp.openById(LOAN_INTENT_FORM_ID))
-      .onFormSubmit()
-      .create();
-    // Trigger for Application Form submissions
-    ScriptApp.newTrigger('onApplicationFormSubmit')
-      .forForm(FormApp.openById(LOAN_APPLICATION_FORM_ID))
-      .onFormSubmit()
-      .create();
-    // Daily reminders
-    ScriptApp.newTrigger('sendDailyReminders')
-      .timeBased()
-      .everyDays(1)
-      .atHour(8)
-      .create();
-    // Sync dropdowns on sheet edit
-    ScriptApp.newTrigger('syncParticipantDetails')
-      .forSpreadsheet()
-      .onEdit()
-      .create();
-    createMenu(); // Add menu
-    Logger.log('Triggers set up successfully!');
-  } catch (e) {
-    Logger.log(`Error setting up triggers: ${e.message}`);
-  }
+  const triggers = [
+    { name: 'sendDailyReminders', type: 'timeBased', everyDays: 1, atHour: 8 },
+    { name: 'onIntentFormSubmit', type: 'formSubmit', formIdKey: 'LOAN_INTENT_FORM_ID' },
+    { name: 'onApplicationFormSubmit', type: 'formSubmit', formIdKey: 'LOAN_APPLICATION_FORM_ID' },
+    { name: 'syncParticipantDetails', type: 'formSubmit', formIdKey: 'LOAN_APPLICATION_FORM_ID' }
+  ];
+  triggers.forEach(trigger => {
+    if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === trigger.name)) {
+      if (trigger.type === 'timeBased') {
+        ScriptApp.newTrigger(trigger.name)
+          .timeBased()
+          .everyDays(trigger.everyDays)
+          .atHour(trigger.atHour)
+          .create();
+        logAction('Success', `Created time-based trigger: ${trigger.name}`);
+      } else if (trigger.type === 'formSubmit') {
+        const formId = PropertiesService.getScriptProperties().getProperty(trigger.formIdKey);
+        if (formId) {
+          ScriptApp.newTrigger(trigger.name)
+            .forForm(formId)
+            .onFormSubmit()
+            .create();
+          logAction('Success', `Created form trigger: ${trigger.name}`);
+        } else {
+          logAction('Error', `Form ID not set for trigger: ${trigger.name}`);
+        }
+      }
+    }
+  });
+  logAction('Success', 'All triggers setup completed');
 }
 
 /**
- * Initializes the system when the spreadsheet opens.
+ * Wrapper to run setUpFormIds from Sheet context.
  */
-function onOpen() {
-  createMenu(); // Add buttons on open
+function runSetUpFormIds() {
+  setUpFormIds();
 }
